@@ -74,6 +74,14 @@ async function getItemWithColumns(boardId, itemId, columnIds) {
   return result?.data?.items?.[0] || null;
 }
 
+function getColumnText(item, columnId) {
+  return item?.column_values?.find((column) => column.id === columnId)?.text || '';
+}
+
+function getColumnValue(item, columnId) {
+  return item?.column_values?.find((column) => column.id === columnId)?.value || '';
+}
+
 async function updateItem(boardId, itemId, columnValues) {
   return mondayRequest(
     `mutation ($boardId: Int!, $itemId: Int!, $columnValues: JSON!) {
@@ -127,8 +135,7 @@ async function getLinkedInventoryCost(itemId) {
     [TIME_TRACKING_COLUMNS.inventoryRelation]
   );
 
-  const relationColumn = item?.column_values?.[0];
-  const linkedItemIds = parseLinkedItemIds(relationColumn?.value);
+  const linkedItemIds = parseLinkedItemIds(getColumnValue(item, TIME_TRACKING_COLUMNS.inventoryRelation));
 
   if (linkedItemIds.length === 0) {
     return { inventoryCost: 0, inventoryItemId: null };
@@ -176,11 +183,6 @@ export default async function handler(req, res) {
   const eventItemId = req.body?.event?.pulseId || req.body?.event?.itemId;
   const boardId = inputData.board_id || req.body?.event?.boardId || TIME_TRACKING_BOARD_ID;
 
-  let qty = toNumber(inputData.qty);
-  let cost = toNumber(inputData.cost);
-  let inventoryCost = toNumber(inputData.inventory_cost);
-  const footage = toNumber(inputData.footage);
-  const name = (inputData.name || inputData.item_name || '').toString().trim();
   const itemId = (inputData.item_id || eventItemId || '').toString().trim();
 
   if (!process.env.MONDAY_API_TOKEN) {
@@ -193,6 +195,23 @@ export default async function handler(req, res) {
       hint: 'Send item_id or rely on a Monday webhook event with pulseId.',
     });
   }
+
+  const currentItem = await getItemWithColumns(
+    boardId,
+    itemId,
+    [
+      TIME_TRACKING_COLUMNS.qty,
+      TIME_TRACKING_COLUMNS.cost,
+      TIME_TRACKING_COLUMNS.footage,
+      TIME_TRACKING_COLUMNS.inventoryRelation,
+    ]
+  );
+
+  let qty = toNumber(inputData.qty || getColumnText(currentItem, TIME_TRACKING_COLUMNS.qty));
+  let cost = toNumber(inputData.cost || getColumnText(currentItem, TIME_TRACKING_COLUMNS.cost));
+  let inventoryCost = toNumber(inputData.inventory_cost);
+  const footage = toNumber(inputData.footage || getColumnText(currentItem, TIME_TRACKING_COLUMNS.footage));
+  const name = (inputData.name || inputData.item_name || currentItem?.name || '').toString().trim();
 
   if (!inventoryCost) {
     const inventoryLookup = await getLinkedInventoryCost(itemId);
