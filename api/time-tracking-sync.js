@@ -1,41 +1,50 @@
 const MONDAY_API_URL = 'https://api.monday.com/v2';
-const TIME_TRACKING_BOARD_ID = 18410440007;
-const INVENTORY_BOARD_ID = 18410440950;
-const TIME_TRACKING_COLUMNS = {
+const BOARD_ID = 6004904071;
+const INVENTORY_BOARD_ID = 5603681269;
+
+// Column IDs in the time tracking board (6004904071)
+const COL = {
   status: 'status',
   qty: 'numbers',
   cost: 'numbers_1',
   footage: 'numbers4',
   total: 'numbers_2',
-  inventoryRelation: 'connect_boards',
-};
-const INVENTORY_COLUMNS = {
-  cost: 'chiffres',
+  inventoryLink: 'connect_boards',
 };
 
-function toNumber(value) {
-  const parsed = parseFloat(value);
-  return Number.isFinite(parsed) ? parsed : 0;
+// Column ID for cost in the inventory board (5603681269)
+const INV_COL_COST = 'chiffres'; // "Cost Price ($)"
+
+function toNum(val) {
+  const n = parseFloat(val);
+  return Number.isFinite(n) ? n : 0;
 }
 
-function readInputData(req) {
-  if (req.body && typeof req.body === 'object') {
-    if (req.body.inputData && typeof req.body.inputData === 'object') {
-      return req.body.inputData;
-    }
+function colText(item, colId) {
+  return item?.column_values?.find((c) => c.id === colId)?.text ?? '';
+}
 
-    if (req.body.event && typeof req.body.event === 'object') {
-      return req.body;
-    }
+function getLinkedItemIds(item) {
+  const col = item?.column_values?.find((c) => c.id === COL.inventoryLink);
+  if (!col) return [];
 
-    return req.body;
+  // Try inline fragment data first (works when Monday returns BoardRelationValue)
+  if (Array.isArray(col.linked_item_ids) && col.linked_item_ids.length) {
+    return col.linked_item_ids.map(String);
   }
 
-  return {};
+  // Fallback: parse raw value JSON
+  try {
+    if (!col.value) return [];
+    const parsed = JSON.parse(col.value);
+    return (parsed?.linkedPulseIds ?? []).map((p) => String(p.linkedPulseId));
+  } catch {
+    return [];
+  }
 }
 
 async function mondayRequest(query, variables = {}) {
-  const response = await fetch(MONDAY_API_URL, {
+  const res = await fetch(MONDAY_API_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -44,130 +53,109 @@ async function mondayRequest(query, variables = {}) {
     body: JSON.stringify({ query, variables }),
   });
 
-  return response.json();
+  const json = await res.json();
+
+  if (!res.ok || json?.errors?.length) {
+    const err = new Error('Monday API error');
+    err.status = res.status;
+    err.details = json;
+    throw err;
+  }
+
+  return json;
 }
 
-async function getItemWithColumns(boardId, itemId, columnIds) {
-  const result = await mondayRequest(
-    `query ($boardId: [ID!], $itemIds: [ID!], $columnIds: [String!]) {
-      boards(ids: $boardId) {
+async function fetchItem(itemId) {
+  const res = await mondayRequest(
+    `query ($ids: [ID!]) {
+      items(ids: $ids) {
         id
         name
-      }
-      items(ids: $itemIds) {
-        id
-        name
-        column_values(ids: $columnIds) {
+        column_values {
           id
           text
           value
+          ... on BoardRelationValue {
+            linked_item_ids
+          }
         }
       }
     }`,
-    {
-      boardId: [String(boardId)],
-      itemIds: [String(itemId)],
-      columnIds,
-    }
+    { ids: [String(itemId)] }
   );
-
-  return result?.data?.items?.[0] || null;
+  return res?.data?.items?.[0] ?? null;
 }
 
-function getColumnText(item, columnId) {
-  return item?.column_values?.find((column) => column.id === columnId)?.text || '';
+// Search inventory board by item name — used when connect_boards returns null (subitem board limitation)
+async function searchInventoryByName(name) {
+  const res = await mondayRequest(
+    `query ($boardId: ID!, $name: String!) {
+      boards(ids: [$boardId]) {
+        items_page(limit: 1, query_params: {
+          rules: [{ column_id: "name", compare_value: [$name] }]
+        }) {
+          items {
+            id
+            name
+            column_values(ids: ["chiffres"]) {
+              id
+              text
+              value
+            }
+          }
+        }
+      }
+    }`,
+    { boardId: String(INVENTORY_BOARD_ID), name }
+  );
+  return res?.data?.boards?.[0]?.items_page?.items?.[0] ?? null;
 }
 
-function getColumnValue(item, columnId) {
-  return item?.column_values?.find((column) => column.id === columnId)?.value || '';
+async function getInventoryCost(timeTrackingItem) {
+  let inventoryItem = null;
+  let lookupMethod = null;
+
+  // Try 1: connect_boards linked IDs (may return null on subitem boards)
+  const linkedIds = getLinkedItemIds(timeTrackingItem);
+  if (linkedIds.length) {
+    lookupMethod = 'connect_boards';
+    inventoryItem = await fetchItem(linkedIds[0]);
+  }
+
+  // Try 2: search inventory by item name (reliable fallback)
+  if (!inventoryItem && timeTrackingItem.name) {
+    lookupMethod = 'name_search';
+    inventoryItem = await searchInventoryByName(timeTrackingItem.name);
+  }
+
+  const cost = inventoryItem ? toNum(colText(inventoryItem, INV_COL_COST)) : 0;
+  return { cost, lookupMethod, inventoryItemId: inventoryItem?.id ?? null };
 }
 
-async function updateItem(boardId, itemId, columnValues) {
+async function updateItemColumns(itemId, columnValues) {
   return mondayRequest(
-    `mutation ($boardId: Int!, $itemId: Int!, $columnValues: JSON!) {
-      change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) {
+    `mutation ($boardId: ID!, $itemId: ID!, $cols: JSON!) {
+      change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $cols) {
         id
       }
     }`,
     {
-      boardId: Number(boardId),
-      itemId: Number(itemId),
-      columnValues: JSON.stringify(columnValues),
+      boardId: String(BOARD_ID),
+      itemId: String(itemId),
+      cols: JSON.stringify(columnValues),
     }
   );
 }
 
-async function createUpdate(itemId, body) {
+async function postComment(itemId, body) {
   return mondayRequest(
-    `mutation ($itemId: Int!, $body: String!) {
+    `mutation ($itemId: ID!, $body: String!) {
       create_update(item_id: $itemId, body: $body) {
         id
       }
     }`,
-    {
-      itemId: Number(itemId),
-      body,
-    }
+    { itemId: String(itemId), body }
   );
-}
-
-function parseLinkedItemIds(columnValue) {
-  if (!columnValue) {
-    return [];
-  }
-
-  try {
-    const parsed = JSON.parse(columnValue);
-    const linkedPulseIds = parsed?.linkedPulseIds || [];
-    return linkedPulseIds
-      .map((item) => item?.linkedPulseId)
-      .filter((itemId) => itemId !== undefined && itemId !== null)
-      .map((itemId) => String(itemId));
-  } catch {
-    return [];
-  }
-}
-
-async function getLinkedInventoryCost(itemId) {
-  const item = await getItemWithColumns(
-    TIME_TRACKING_BOARD_ID,
-    itemId,
-    [TIME_TRACKING_COLUMNS.inventoryRelation]
-  );
-
-  const linkedItemIds = parseLinkedItemIds(getColumnValue(item, TIME_TRACKING_COLUMNS.inventoryRelation));
-
-  if (linkedItemIds.length === 0) {
-    return { inventoryCost: 0, inventoryItemId: null };
-  }
-
-  const inventoryItem = await getItemWithColumns(
-    INVENTORY_BOARD_ID,
-    linkedItemIds[0],
-    [INVENTORY_COLUMNS.cost]
-  );
-
-  return {
-    inventoryCost: toNumber(inventoryItem?.column_values?.[0]?.text),
-    inventoryItemId: inventoryItem?.id || null,
-  };
-}
-
-function buildUpdateBody({ name, qty, cost, inventoryCost, footage, total, usedInventoryCost }) {
-  const lines = [
-    `Name: ${name || 'N/A'}`,
-    `Qty: ${qty}`,
-    `Cost: ${cost}`,
-    `Inventory cost: ${inventoryCost}`,
-    `Footage: ${footage}`,
-    `Total: ${total}`,
-  ];
-
-  if (usedInventoryCost) {
-    lines.push('Cost source: inventory fallback');
-  }
-
-  return lines.join('\n');
 }
 
 export default async function handler(req, res) {
@@ -179,87 +167,86 @@ export default async function handler(req, res) {
     return res.status(200).json({ challenge: req.body.challenge });
   }
 
-  const inputData = readInputData(req);
-  const eventItemId = req.body?.event?.pulseId || req.body?.event?.itemId;
-  const boardId = inputData.board_id || req.body?.event?.boardId || TIME_TRACKING_BOARD_ID;
-
-  const itemId = (inputData.item_id || eventItemId || '').toString().trim();
-
   if (!process.env.MONDAY_API_TOKEN) {
     return res.status(500).json({ error: 'Missing MONDAY_API_TOKEN' });
   }
 
+  const itemId = String(req.body?.event?.pulseId || req.body?.event?.itemId || '').trim();
   if (!itemId) {
-    return res.status(400).json({
-      error: 'Missing item id',
-      hint: 'Send item_id or rely on a Monday webhook event with pulseId.',
-    });
+    return res.status(200).json({ success: false, error: 'Missing item ID in webhook payload' });
   }
 
-  const currentItem = await getItemWithColumns(
-    boardId,
-    itemId,
-    [
-      TIME_TRACKING_COLUMNS.qty,
-      TIME_TRACKING_COLUMNS.cost,
-      TIME_TRACKING_COLUMNS.footage,
-      TIME_TRACKING_COLUMNS.inventoryRelation,
-    ]
-  );
+  let item;
+  try {
+    item = await fetchItem(itemId);
+  } catch (err) {
+    console.error('[monday] fetch item failed', { itemId, details: err.details ?? err.message });
+    return res.status(200).json({ success: false, error: 'Failed to fetch item', details: err.details ?? err.message });
+  }
 
-  let qty = toNumber(inputData.qty || getColumnText(currentItem, TIME_TRACKING_COLUMNS.qty));
-  let cost = toNumber(inputData.cost || getColumnText(currentItem, TIME_TRACKING_COLUMNS.cost));
-  let inventoryCost = toNumber(inputData.inventory_cost);
-  const footage = toNumber(inputData.footage || getColumnText(currentItem, TIME_TRACKING_COLUMNS.footage));
-  const name = (inputData.name || inputData.item_name || currentItem?.name || '').toString().trim();
+  if (!item) {
+    return res.status(200).json({ success: false, error: 'Item not found', item_id: itemId });
+  }
 
-  if (!inventoryCost) {
-    const inventoryLookup = await getLinkedInventoryCost(itemId);
-    inventoryCost = inventoryLookup.inventoryCost;
+  // Skip if status is already "Loaded"
+  if (colText(item, COL.status) === 'Loaded') {
+    return res.status(200).json({ success: true, skipped: true, reason: 'Status is Loaded', item_id: itemId });
+  }
+
+  let qty = toNum(colText(item, COL.qty));
+  let cost = toNum(colText(item, COL.cost));
+  const footage = toNum(colText(item, COL.footage));
+
+  let inventoryCost = 0;
+  let inventoryLookup = null;
+  if (cost === 0) {
+    try {
+      inventoryLookup = await getInventoryCost(item);
+      inventoryCost = inventoryLookup.cost;
+    } catch (err) {
+      console.error('[monday] inventory lookup failed', { itemId, details: err.details ?? err.message });
+    }
   }
 
   const usedInventoryCost = cost === 0 && inventoryCost > 0;
-  if (usedInventoryCost) {
-    cost = inventoryCost;
-  }
+  if (usedInventoryCost) cost = inventoryCost;
 
   const total = Number((qty * cost).toFixed(2));
 
-  const columnValues = {
-    [TIME_TRACKING_COLUMNS.qty]: qty,
-    [TIME_TRACKING_COLUMNS.cost]: cost,
-    [TIME_TRACKING_COLUMNS.footage]: footage,
-    [TIME_TRACKING_COLUMNS.total]: total,
-  };
+  try {
+    await updateItemColumns(itemId, {
+      [COL.qty]: qty,
+      [COL.cost]: cost,
+      [COL.footage]: footage,
+      [COL.total]: total,
+    });
+  } catch (err) {
+    console.error('[monday] update failed', { itemId, details: err.details ?? err.message });
+    return res.status(200).json({ success: false, error: 'Failed to update item', details: err.details ?? err.message });
+  }
 
-  const updateResult = await updateItem(boardId, itemId, columnValues);
-
-  let noteResult = null;
-  if (usedInventoryCost || qty === 0 || cost === 0) {
-    noteResult = await createUpdate(
-      itemId,
-      buildUpdateBody({
-        name,
-        qty,
-        cost,
-        inventoryCost,
-        footage,
-        total,
-        usedInventoryCost,
-      })
-    );
+  // Post warning if cost is still 0 after inventory lookup
+  if (cost === 0) {
+    try {
+      await postComment(itemId, '🚨 The item cost is not defined');
+    } catch (err) {
+      console.error('[monday] post comment failed', { itemId, details: err.details ?? err.message });
+    }
   }
 
   return res.status(200).json({
     success: true,
-    board_id: TIME_TRACKING_BOARD_ID,
     item_id: itemId,
+    name: item.name,
     qty,
     cost,
-    inventory_cost: inventoryCost,
     footage,
     total,
-    updated: Boolean(updateResult?.data),
-    update_noted: Boolean(noteResult?.data),
+    inventory_cost: inventoryCost,
+    used_inventory_cost: usedInventoryCost,
+    _debug: {
+      inventory_lookup_method: inventoryLookup?.lookupMethod ?? null,
+      inventory_item_id: inventoryLookup?.inventoryItemId ?? null,
+    },
   });
 }
