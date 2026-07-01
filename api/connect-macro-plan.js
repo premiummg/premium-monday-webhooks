@@ -1,22 +1,23 @@
 const MONDAY_API_URL = 'https://api.monday.com/v2';
 const BOARD_ID = 5679186588;
-
-// All boards connected via the "🌍 Macro Plan" column — searched in order
 const MACRO_PLAN_BOARD_IDS = [5603041438, 18410435691, 18411058373];
 
-// Column IDs in the time tracking board (5679186588)
 const COL = {
-  projectName: 'dropdown__1',  // "📄Project Name" — used as lookup key
-  macroPlan: 'connect_boards', // "🌍 Macro Plan" — board_relation to update
-  triggerMacro: 'status6',     // "⚙️ Trigger Macro adjusted"
-  macroConnexion: 'status60',  // "⚙️ Macro Connexion"
+  projectName1:   'dropdown__1',       // "📄Project Name"
+  projectName2:   'dropdown_mkv0khrr', // "📄Project Name List 2"
+  macroPlan:      'connect_boards',    // "🌍 Macro Plan"
+  triggerMacro:   'status6',           // "⚙️ Trigger Macro adjusted"
+  macroConnexion: 'status60',          // "⚙️ Macro Connexion"
 };
 
-// Column in the Macro Plan boards that holds the project name for matching
-const MACRO_SEARCH_COL = 'text__1'; // "⚙️ Project Name in Forms"
-
 function colText(item, colId) {
-  return item?.column_values?.find((c) => c.id === colId)?.text ?? '';
+  return item?.column_values?.find((c) => c.id === colId)?.text?.trim() ?? '';
+}
+
+function extractProjectNumber(name) {
+  if (!name) return null;
+  const part = name.split('|')[0].trim();
+  return part || null;
 }
 
 async function mondayRequest(query, variables = {}) {
@@ -47,10 +48,9 @@ async function fetchItem(itemId) {
       items(ids: $ids) {
         id
         name
-        column_values(ids: ["dropdown__1"]) {
+        column_values(ids: ["dropdown__1", "dropdown_mkv0khrr"]) {
           id
           text
-          value
         }
       }
     }`,
@@ -59,16 +59,38 @@ async function fetchItem(itemId) {
   return res?.data?.items?.[0] ?? null;
 }
 
-async function searchMacroPlanByName(projectName) {
-  // compare_value expects Monday's CompareValue scalar — must be inlined, not passed as a variable
-  const escapedName = JSON.stringify(projectName);
+// Method 1: search by project number in "# Project" (text) — board 5603041438 only
+async function searchByProjectNumber(projectNumber) {
+  const escaped = JSON.stringify(projectNumber);
+  const res = await mondayRequest(
+    `query {
+      boards(ids: [5603041438]) {
+        items_page(limit: 5, query_params: {
+          rules: [{ column_id: "text", compare_value: [${escaped}], operator: contains_text }]
+        }) {
+          items {
+            id
+            name
+            column_values(ids: ["text"]) { id text }
+          }
+        }
+      }
+    }`
+  );
+  const items = res?.data?.boards?.[0]?.items_page?.items ?? [];
+  return items.find((i) => i.column_values?.[0]?.text?.trim() === projectNumber) ?? null;
+}
+
+// Method 2: search by full project name in "⚙️ Project Name in Forms" (text__1) — all 3 boards
+async function searchByProjectName(projectName) {
+  const escaped = JSON.stringify(projectName);
   const results = await Promise.all(
     MACRO_PLAN_BOARD_IDS.map(async (boardId) => {
       const res = await mondayRequest(
         `query ($boardId: ID!) {
           boards(ids: [$boardId]) {
-            items_page(limit: 10, query_params: {
-              rules: [{ column_id: "text__1", compare_value: [${escapedName}], operator: contains_text }]
+            items_page(limit: 5, query_params: {
+              rules: [{ column_id: "text__1", compare_value: [${escaped}], operator: contains_text }]
             }) {
               items {
                 id
@@ -81,7 +103,7 @@ async function searchMacroPlanByName(projectName) {
         { boardId: String(boardId) }
       );
       const items = res?.data?.boards?.[0]?.items_page?.items ?? [];
-      return items.find((i) => i.column_values?.[0]?.text?.trim() === projectName.trim()) ?? null;
+      return items.find((i) => i.column_values?.[0]?.text?.trim() === projectName) ?? null;
     })
   );
   return results.find((r) => r !== null) ?? null;
@@ -135,64 +157,80 @@ export default async function handler(req, res) {
   try {
     item = await fetchItem(itemId);
   } catch (err) {
-    console.error('[monday] fetch item failed', { itemId, details: err.details ?? err.message });
-    return res.status(200).json({ success: false, error: 'Failed to fetch item', details: err.details ?? err.message });
+    console.error('[monday] fetch item failed', JSON.stringify({ itemId, details: err.details ?? err.message }));
+    return res.status(200).json({ success: false, error: 'Failed to fetch item' });
   }
 
   if (!item) {
     return res.status(200).json({ success: false, error: 'Item not found', item_id: itemId });
   }
 
-  const projectName = colText(item, COL.projectName);
+  const projectName = colText(item, COL.projectName1) || colText(item, COL.projectName2);
   if (!projectName) {
     return res.status(200).json({ success: false, error: 'Project Name column is empty', item_id: itemId });
   }
 
-  // Search all Macro Plan boards for a matching project
+  const projectNumber = extractProjectNumber(projectName);
+
+  // Try method 1: by project number in "# Project" column
   let macroPlanItem = null;
+  let method = null;
+
   try {
-    macroPlanItem = await searchMacroPlanByName(projectName);
+    if (projectNumber) {
+      macroPlanItem = await searchByProjectNumber(projectNumber);
+      if (macroPlanItem) method = 'project_number';
+    }
   } catch (err) {
-    console.error('[monday] macro plan search failed', JSON.stringify({ itemId, projectName, details: err.details ?? err.message }, null, 2));
-    return res.status(200).json({ success: false, error: 'Macro Plan search failed', details: err.details ?? err.message });
+    console.error('[monday] search by number failed', JSON.stringify({ itemId, projectNumber, details: err.details ?? err.message }));
+  }
+
+  // Try method 2: by full name in "⚙️ Project Name in Forms" column
+  if (!macroPlanItem) {
+    try {
+      macroPlanItem = await searchByProjectName(projectName);
+      if (macroPlanItem) method = 'project_name';
+    } catch (err) {
+      console.error('[monday] search by name failed', JSON.stringify({ itemId, projectName, details: err.details ?? err.message }));
+    }
   }
 
   if (macroPlanItem) {
-    // Path A: found — connect to Macro Plan and set status to "Connected"
     try {
       await updateItem(itemId, {
-        [COL.macroPlan]: { item_ids: [Number(macroPlanItem.id)] },
-        [COL.triggerMacro]: { label: 'Connected' },
+        [COL.macroPlan]:      { item_ids: [Number(macroPlanItem.id)] },
+        [COL.triggerMacro]:   { label: 'Connected' },
         [COL.macroConnexion]: { label: 'Connected' },
       });
     } catch (err) {
-      console.error('[monday] update failed (path A)', { itemId, details: err.details ?? err.message });
-      return res.status(200).json({ success: false, error: 'Failed to update item', details: err.details ?? err.message });
+      console.error('[monday] update failed', JSON.stringify({ itemId, details: err.details ?? err.message }));
+      return res.status(200).json({ success: false, error: 'Failed to update item' });
     }
 
     return res.status(200).json({
       success: true,
       found: true,
+      method,
       item_id: itemId,
       project_name: projectName,
+      project_number: projectNumber,
       macro_plan_item_id: macroPlanItem.id,
       macro_plan_item_name: macroPlanItem.name,
     });
   } else {
-    // Path B: not found — clear trigger, set connexion to ERROR, post warning
     try {
       await updateItem(itemId, {
-        [COL.triggerMacro]: { label: '' },
+        [COL.triggerMacro]:   { label: '' },
         [COL.macroConnexion]: { label: 'ERROR' },
       });
     } catch (err) {
-      console.error('[monday] update failed (path B)', { itemId, details: err.details ?? err.message });
+      console.error('[monday] update failed (not found)', JSON.stringify({ itemId, details: err.details ?? err.message }));
     }
 
     try {
       await postComment(itemId, '🚨 The inventory log did not connect to the Macro Plan Project');
     } catch (err) {
-      console.error('[monday] post comment failed', { itemId, details: err.details ?? err.message });
+      console.error('[monday] post comment failed', JSON.stringify({ itemId, details: err.details ?? err.message }));
     }
 
     return res.status(200).json({
@@ -200,6 +238,7 @@ export default async function handler(req, res) {
       found: false,
       item_id: itemId,
       project_name: projectName,
+      project_number: projectNumber,
     });
   }
 }
