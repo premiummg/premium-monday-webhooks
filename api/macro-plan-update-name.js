@@ -93,7 +93,8 @@ export default async function handler(req, res) {
   }
 
   const projectNumber = item.column_values?.[0]?.text?.trim() ?? '';
-  const newName = projectNumber ? `${projectNumber} | ${item.name}` : item.name;
+  const alreadyPrefixed = projectNumber && item.name.startsWith(`${projectNumber} |`);
+  const newName = projectNumber && !alreadyPrefixed ? `${projectNumber} | ${item.name}` : item.name;
 
   try {
     await updateItem(itemId, {
