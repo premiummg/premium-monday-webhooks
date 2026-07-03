@@ -213,22 +213,24 @@ export default async function handler(req, res) {
 
   const total = Number((qty * cost).toFixed(2));
 
+  const newStatus = cost > 0 ? 'Loaded' : 'ERROR';
+
   try {
     await updateItemColumns(itemId, {
-      [COL.qty]: qty,
-      [COL.cost]: cost,
+      [COL.status]:  { label: newStatus },
+      [COL.qty]:     qty,
+      [COL.cost]:    cost,
       [COL.footage]: footage,
-      [COL.total]: total,
+      [COL.total]:   total,
     });
   } catch (err) {
     console.error('[monday] update failed', { itemId, details: err.details ?? err.message });
     return res.status(200).json({ success: false, error: 'Failed to update item', details: err.details ?? err.message });
   }
 
-  // Post warning if cost is still 0 after inventory lookup
   if (cost === 0) {
     try {
-      await postComment(itemId, '🚨 The item cost is not defined');
+      await postComment(itemId, 'The item cost is not defined');
     } catch (err) {
       console.error('[monday] post comment failed', { itemId, details: err.details ?? err.message });
     }
