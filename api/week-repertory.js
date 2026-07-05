@@ -110,14 +110,27 @@ export default async function handler(req, res) {
     }
   } catch {}
 
-  // 5. Create next week item in Week Repertory (triggers this webhook again)
+  // 5. Create next week item in Week Repertory with Date Trigger = nextStart
   try {
-    await mondayRequest(
+    const newItem = await mondayRequest(
       `mutation ($b: ID!, $g: String!, $n: String!) {
         create_item(board_id: $b, group_id: $g, item_name: $n) { id }
       }`,
       { b: String(WEEK_REPERTORY_BOARD), g: TOPICS_GROUP, n: nextWeekName }
     );
+    const newItemId = newItem?.data?.create_item?.id;
+    if (newItemId) {
+      await mondayRequest(
+        `mutation ($b: ID!, $i: ID!, $c: JSON!) {
+          change_multiple_column_values(board_id: $b, item_id: $i, column_values: $c) { id }
+        }`,
+        {
+          b: String(WEEK_REPERTORY_BOARD),
+          i: String(newItemId),
+          c: JSON.stringify({ date: { date: nextStart } }),
+        }
+      );
+    }
   } catch (err) {
     console.error('[week-repertory] create next item failed', JSON.stringify({ nextWeekName, details: err.details ?? err.message }));
   }
