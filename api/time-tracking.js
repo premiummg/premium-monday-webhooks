@@ -351,8 +351,9 @@ async function handleInventoryLogForm(req, res, itemId) {
 
 function parseDateTimeCol(item, colId) {
   const col = item?.column_values?.find(c => c.id === colId);
-  if (!col?.value) return null;
-  try { const p = JSON.parse(col.value); return { date: p.date ?? null, time: p.time ?? null }; } catch { return null; }
+  if (!col?.text) return null;
+  const [date, time] = col.text.split(' ');
+  return { date: date ?? null, time: time ?? null };
 }
 
 function timeToDecimal(t) {
