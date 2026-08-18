@@ -31,6 +31,29 @@ function weeksFromNow(dateStr) {
   return (d - Date.now()) / (1000 * 60 * 60 * 24 * 7);
 }
 
+async function findGroupByTitle(boardId, title) {
+  const r = await mondayRequest(
+    `query ($b: ID!) { boards(ids: [$b]) { groups { id title } } }`,
+    { b: String(boardId) }
+  );
+  const groups = r?.data?.boards?.[0]?.groups ?? [];
+  return groups.find(g => g.title === title) ?? null;
+}
+
+async function findItemByTextValue(boardId, val) {
+  const r = await mondayRequest(
+    `query ($b: ID!, $val: String!) {
+      boards(ids: [$b]) {
+        items_page(limit: 1, query_params: { rules: [{ column_id: "text", compare_value: [$val] }] }) {
+          items { id }
+        }
+      }
+    }`,
+    { b: String(boardId), val }
+  );
+  return r?.data?.boards?.[0]?.items_page?.items?.[0] ?? null;
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
   if (req.body?.challenge)   return res.status(200).json({ challenge: req.body.challenge });
@@ -49,18 +72,46 @@ export default async function handler(req, res) {
     return res.status(200).json({ success: false, error: 'Invalid date range format', name: itemName });
   }
 
-  // 1. Create group in Time Sheet with the week name
+  // 1. Create group in Time Sheet with the week name (reuse if it already exists,
+  // so a duplicate webhook delivery doesn't spawn a second identical group)
   let newGroupId;
   try {
-    const r = await mondayRequest(
-      `mutation ($b: ID!, $n: String!) { create_group(board_id: $b, group_name: $n) { id } }`,
-      { b: String(TIMESHEET_BOARD), n: itemName }
-    );
-    newGroupId = r?.data?.create_group?.id;
-    if (!newGroupId) throw new Error('No group ID returned');
+    const existingGroup = await findGroupByTitle(TIMESHEET_BOARD, itemName);
+    if (existingGroup) {
+      newGroupId = existingGroup.id;
+    } else {
+      const r = await mondayRequest(
+        `mutation ($b: ID!, $n: String!) { create_group(board_id: $b, group_name: $n) { id } }`,
+        { b: String(TIMESHEET_BOARD), n: itemName }
+      );
+      newGroupId = r?.data?.create_group?.id;
+      if (!newGroupId) throw new Error('No group ID returned');
+    }
   } catch (err) {
     console.error('[week-repertory] create_group failed', JSON.stringify({ itemName, details: err.details ?? err.message }));
     return res.status(200).json({ success: false, error: 'Failed to create Time Sheet group' });
+  }
+
+  // 1b. Ensure a template item exists in that group with its "text" column set to
+  // the group ID — this is what timesheet.js's searchByGroupId looks up to find the
+  // week's start/end dates for every new timesheet item created in the group.
+  try {
+    const templateItem = await findItemByTextValue(TIMESHEET_BOARD, newGroupId);
+    if (!templateItem) {
+      const created = await mondayRequest(
+        `mutation ($b: ID!, $g: String!, $n: String!) { create_item(board_id: $b, group_id: $g, item_name: $n) { id } }`,
+        { b: String(TIMESHEET_BOARD), g: newGroupId, n: itemName }
+      );
+      const templateItemId = created?.data?.create_item?.id;
+      if (templateItemId) {
+        await mondayRequest(
+          `mutation ($b: ID!, $i: ID!, $c: JSON!) { change_multiple_column_values(board_id: $b, item_id: $i, column_values: $c) { id } }`,
+          { b: String(TIMESHEET_BOARD), i: String(templateItemId), c: JSON.stringify({ text: newGroupId }) }
+        );
+      }
+    }
+  } catch (err) {
+    console.error('[week-repertory] ensure template item failed', JSON.stringify({ newGroupId, details: err.details ?? err.message }));
   }
 
   // 2. Update Week Repertory item: store group ID and set timeline + status

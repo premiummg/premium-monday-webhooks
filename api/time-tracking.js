@@ -26,6 +26,30 @@ function colText(item, colId) {
   return item?.column_values?.find(c => c.id === colId)?.text?.trim() ?? '';
 }
 
+// ─── Loop guard ────────────────────────────────────────────────────────────────
+// Generic safety net: if the same item+column trigger fires far more than a
+// normal single edit would (Monday retrying a slow/timed-out webhook delivery,
+// or anything else re-sending the same event), stop and flag it instead of
+// quietly repeating side effects (duplicate items, comments, updates) forever.
+//
+// State is in-memory only (no new infra/dependencies) — it persists across warm
+// invocations of the same function instance, which covers retries clustered in
+// the same burst. It won't catch every possible cause, but it caps the damage:
+// a repeat that would otherwise keep firing indefinitely now stops after a few
+// attempts and leaves a visible trail on the item.
+const LOOP_WINDOW_MS   = 10 * 60 * 1000; // 10 minutes
+const LOOP_MAX_HITS    = 5;              // legitimate edits don't retrigger this fast
+const recentInvocations = new Map();     // `${itemId}:${columnId}` -> [timestamps]
+
+function isLooping(itemId, columnId) {
+  const key = `${itemId}:${columnId}`;
+  const now = Date.now();
+  const hits = (recentInvocations.get(key) ?? []).filter(t => now - t < LOOP_WINDOW_MS);
+  hits.push(now);
+  recentInvocations.set(key, hits);
+  return hits.length > LOOP_MAX_HITS;
+}
+
 function todayDate() { return new Date().toISOString().split('T')[0]; }
 function tomorrowDate() { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().split('T')[0]; }
 
@@ -261,12 +285,17 @@ async function handleInventoryLogForm(req, res, itemId) {
           id text
           ... on BoardRelationValue { linked_item_ids }
         }
+        subitems { id }
       }
     }`,
     { ids: [itemId] }
   );
   const formItem = res1?.data?.items?.[0];
   if (!formItem) return res.status(200).json({ success: false, error: 'Form item not found', item_id: itemId });
+
+  if (formItem.subitems?.length > 0) {
+    return res.status(200).json({ success: false, error: 'Already loaded, skipping duplicate trigger', item_id: itemId, existing_subitems: formItem.subitems.length });
+  }
 
   const colMap    = Object.fromEntries(formItem.column_values.map(c => [c.id, c]));
   const getColTxt = id => colMap[id]?.text?.trim() ?? '';
@@ -451,6 +480,14 @@ export default async function handler(req, res) {
 
   const route = ROUTES[columnId];
   if (!route)  return res.status(200).json({ success: false, error: 'Unknown trigger column', column_id: columnId });
+
+  if (isLooping(itemId, columnId)) {
+    console.error('[monday] loop guard tripped', JSON.stringify({ columnId, itemId }));
+    try {
+      await postComment(itemId, `🚨 This automation (column "${columnId}") fired more than ${LOOP_MAX_HITS} times in ${LOOP_WINDOW_MS / 60000} minutes and was stopped to prevent a runaway loop. Check what's repeatedly triggering this before re-editing the column.`);
+    } catch {}
+    return res.status(200).json({ success: false, error: 'Loop guard: too many invocations for this item+column', column_id: columnId, item_id: itemId });
+  }
 
   try {
     return await route(req, res, itemId);
