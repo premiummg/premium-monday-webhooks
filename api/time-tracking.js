@@ -385,10 +385,29 @@ function parseDateTimeCol(item, colId) {
   return { date: date ?? null, time: time ?? null };
 }
 
-function timeToDecimal(t) {
-  if (!t) return null;
-  const [h, m] = t.split(':').map(Number);
-  return parseFloat((h + m / 60).toFixed(2));
+// 'date'/'date2' are stored in UTC (see TimesheetColumnMapper::toUtcDateTimes in
+// premium-app) — numbers2__1/numbers88__1 must be the LOCAL hour, so convert back
+// before deriving them. Single fixed zone, matching premium-app's
+// config('monday.account_timezone') default — good enough until a team-specific
+// override is actually needed here too.
+const DISPLAY_TIMEZONE = 'America/Halifax';
+
+function utcDateTimeToLocal(dateStr, timeStr, timeZone = DISPLAY_TIMEZONE) {
+  const utcDate = new Date(`${dateStr}T${timeStr}Z`);
+  if (Number.isNaN(utcDate.getTime())) return null;
+
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(utcDate);
+
+  const get = (type) => parts.find(p => p.type === type)?.value;
+  const hour = Number(get('hour')) % 24; // Intl can return "24" for midnight
+
+  return {
+    date: `${get('year')}-${get('month')}-${get('day')}`,
+    decimal: parseFloat((hour + Number(get('minute')) / 60).toFixed(2)),
+  };
 }
 
 async function handleLoadDateHour(req, res, itemId) {
@@ -409,11 +428,20 @@ async function handleLoadDateHour(req, res, itemId) {
     return res.status(200).json({ success: true, valid: false, item_id: itemId });
   }
 
+  const startLocal = utcDateTimeToLocal(startDT.date, startDT.time);
+  const endLocal   = utcDateTimeToLocal(endDT.date, endDT.time);
+
+  if (!startLocal || !endLocal) {
+    try { await updateBoardItem(BOARD_ID, itemId, { status1__1: { label: 'ERROR' } }); } catch {}
+    try { await postComment(itemId, "🚨 Could not convert 'Work start/end date + Hour' to local time (unparseable date/time). Please re-enter and change the status '⚙️ Load Data in date & Hour' to 'Loading'."); } catch {}
+    return res.status(200).json({ success: true, valid: false, item_id: itemId });
+  }
+
   await updateBoardItem(BOARD_ID, itemId, {
-    date9__1:    { date: startDT.date },
-    numbers2__1: timeToDecimal(startDT.time),
-    numbers88__1: timeToDecimal(endDT.time),
-    date1__1:    { date: endDT.date },
+    date9__1:    { date: startLocal.date },
+    numbers2__1: startLocal.decimal,
+    numbers88__1: endLocal.decimal,
+    date1__1:    { date: endLocal.date },
     status1__1:  { label: 'Loaded' },
     text2__1:    item.name,
   });
@@ -445,9 +473,21 @@ async function handleTimesheetApprove(req, res, itemId) {
     `query ($ids: [ID!]) { items(ids: $ids) { column_values(ids: ["numbers2__1","numbers88__1","status8__1"]) { id text } } }`,
     { ids: [itemId] }
   );
-  const cols       = res1?.data?.items?.[0]?.column_values || [];
-  const startHour  = parseFloat(cols.find(c => c.id === 'numbers2__1')?.text  || 0);
-  const endTime    = parseFloat(cols.find(c => c.id === 'numbers88__1')?.text  || 0);
+  const cols          = res1?.data?.items?.[0]?.column_values || [];
+  const startHourText = cols.find(c => c.id === 'numbers2__1')?.text;
+  const endTimeText   = cols.find(c => c.id === 'numbers88__1')?.text;
+  const startHour     = parseFloat(startHourText);
+  const endTime       = parseFloat(endTimeText);
+
+  // numbers2__1/numbers88__1 can be blank (e.g. 'Load Data in date & Hour' hasn't
+  // run, or failed) — without this guard, missing values silently parse to 0 and
+  // produce a nonsense total (real case: -0.5 / 0 written for items with no hours
+  // loaded yet) instead of leaving it alone until the real hours are present.
+  if (!startHourText || !endTimeText || Number.isNaN(startHour) || Number.isNaN(endTime)) {
+    try { await postComment(itemId, "🚨 Cannot compute 'Total Work Hour' — 'Start Hour' and/or 'End Time' are blank. Make sure '⚙️ Load Data in date & Hour' has run successfully, then re-trigger approval."); } catch {}
+    return res.status(200).json({ success: false, error: 'Missing start/end hour', item_id: itemId });
+  }
+
   const lunch      = cols.find(c => c.id === 'status8__1')?.text || '';
   const breakHours = lunch === 'Yes' ? 0.5 : 0;
   const hours      = parseFloat((endTime - startHour - breakHours).toFixed(2));
